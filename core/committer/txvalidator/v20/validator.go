@@ -8,7 +8,22 @@ package txvalidator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strconv"
 	"time"
+
+	config "github.com/hyperledger/fabric/weaveutils/config"
+	contribution "github.com/hyperledger/fabric/weaveutils/contribution"
+	structures "github.com/hyperledger/fabric/weaveutils/structures"
+
+	fountain "github.com/Watchdog-Network/gofountain"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/lovoo/goka"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
@@ -29,6 +44,69 @@ import (
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 )
+
+// This codec allows marshalling (encode) and unmarshalling (decode) the user to and from the
+// goka group table.
+type ackCodec struct{}
+
+type CurrentBlock struct {
+	Id []byte
+
+	// ackResultChan indicates that the producer keep sending encoded symbols
+	// true = stop, false = push
+	ackResultChan chan bool
+
+	produceChan chan kafka.Event
+}
+
+var (
+	kafkabroker1 = os.Getenv("KAFKA_BROKER1")
+	kafkabroker2 = os.Getenv("KAFKA_BROKER2")
+	kafkabroker3 = os.Getenv("KAFKA_BROKER3")
+
+	tmc *goka.TopicManagerConfig
+
+	// producerSize indicates the number of producers
+	producerSize int = 20
+	// defaultPartitionChannelSize is same with producerSize because producers push data into its partition
+	defaultPartitionChannelSize int = 20
+
+	ackResultChan = make(chan bool)
+
+	kafkaProducer *kafka.Producer
+)
+
+// init sets goka default settings
+func init() {
+	tmc = goka.NewTopicManagerConfig()
+	tmc.Table.Replication = 3
+	tmc.Stream.Replication = 3
+
+	kafkaProducer = config.Kafka()
+}
+
+func (cb *CurrentBlock) setAckChannel(val bool) {
+	cb.ackResultChan <- val
+}
+
+// Encodes structures.Ack into []byte
+func (ac *ackCodec) Encode(value interface{}) ([]byte, error) {
+	if _, isAck := value.(*structures.ACK); !isAck {
+		return nil, fmt.Errorf("ACK Codec requires value *structures.ACK, got %T", value)
+	}
+
+	return json.Marshal(value)
+}
+
+// Decodes a structures.Ack from []byte to it's go representation
+func (ac *ackCodec) Decode(data []byte) (interface{}, error) {
+	var c structures.ACK
+	err := json.Unmarshal(data, &c)
+	if err != nil {
+		return nil, fmt.Errorf("ackCodec Decode Error: %v", err)
+	}
+	return &c, nil
+}
 
 // Semaphore provides to the validator means for synchronisation
 type Semaphore interface {
@@ -181,6 +259,17 @@ func (v *TxValidator) Validate(block *common.Block) error {
 	var err error
 	var errPos int
 
+	cb := CurrentBlock{
+		Id:            block.Header.DataHash,
+		ackResultChan: make(chan bool),
+		produceChan:   make(chan kafka.Event),
+	}
+
+	// run background when it receives first block
+	if block.Header.Number <= 1 {
+		go cb.ackListener()
+	}
+
 	startValidation := time.Now() // timer to log Validate block duration
 	logger.Debugf("[%s] START Block Validation for block [%d]", v.ChannelID, block.Header.Number)
 
@@ -261,7 +350,170 @@ func (v *TxValidator) Validate(block *common.Block) error {
 	elapsedValidation := time.Since(startValidation) / time.Millisecond // duration in ms
 	logger.Infof("[%s] Validated block [%d] in %dms", v.ChannelID, block.Header.Number, elapsedValidation)
 
+	cb.produceContribution(block, v.ChannelID)
+
+	cb.producer(block, v.ChannelID)
+
 	return nil
+}
+
+// produceContribution monitors the number of blocks sent by the producer to detect which producers are not working.
+func (cb *CurrentBlock) produceContribution(block *common.Block, channelID string) {
+	topic := "contribution-topic"
+
+	deliveryChan := make(chan kafka.Event, 1000000)
+
+	data := contribution.FabricChannel{
+		Type:         1,
+		ChannelId:    channelID,
+		BlockNumber:  int(block.Header.Number),
+		Transactions: len(block.GetData().GetData()),
+	}
+
+	value, _ := json.Marshal(data)
+
+	err := kafkaProducer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Value:          value,
+	}, deliveryChan)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// producer structures the block data.
+func (cb *CurrentBlock) producer(block *common.Block, channelID string) {
+	host := os.Getenv("CORE_PEER_ID")
+
+	parsedBlock := fountain.HLFEncodedBlock{
+		BlockHeader:   fountain.BlockHeader{Number: block.Header.Number, PreviousHash: block.Header.PreviousHash, DataHash: block.Header.DataHash},
+		BlockData:     fountain.BlockData{Data: block.Data.Data},
+		BlockMetadata: fountain.BlockMetadata{Metadata: block.Metadata.Metadata},
+	}
+
+	cb.Id = parsedBlock.BlockHeader.DataHash
+
+	cb.produceSymbols(host, channelID, parsedBlock)
+}
+
+// produceSymbols encodes blockdata ans divides it into symbols.
+// The divided symbols are bundled and delivered to kafka
+// to balance the time write symbols on the kafka and the time due to network delay.
+func (cb *CurrentBlock) produceSymbols(peer string, channelID string, parsedBlock fountain.HLFEncodedBlock) {
+
+	peerNumber, _ := strconv.Atoi(os.Getenv("PEER_NUMBER"))
+
+	marshalledBlock, numSourceSymbols, symbolAlignmentSize, numEncodedSourceSymbols := fountain.EqualizeParsedBlockLengths(parsedBlock)
+
+	encodingData := fountain.Encode(marshalledBlock, numSourceSymbols, symbolAlignmentSize, numEncodedSourceSymbols)
+	hash := sha256.Sum256(marshalledBlock)
+
+	var bdata structures.BlockData
+
+	bundle, _ := strconv.Atoi(os.Getenv("BUNDLE"))
+	var count = 0
+	for i := 0; i < len(encodingData)/peerNumber; i++ {
+		// Push an encoded symbol until receiving OK sign
+		select {
+		case stop := <-cb.ackResultChan:
+			if stop {
+				cb.setAckChannel(false)
+				return
+			}
+		default:
+			var sdata structures.SymbolData
+			sdata.Id = peer
+			sdata.SourceData = encodingData[i]
+			sdata.Length = len(marshalledBlock)
+			sdata.Hash = hash
+
+			bdata.Symbols = append(bdata.Symbols, sdata)
+
+			if (i+1)%bundle == 0 {
+				bdata.Channel = channelID
+				bdata.Id = peer
+				bdata.Hash = hash
+				bdata.Length = len(marshalledBlock)
+
+				value, err := json.Marshal(bdata)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				bdata.Symbols = bdata.Symbols[:0]
+
+				cb.pushBundle(parsedBlock.BlockHeader.Number, count, channelID, value)
+				count++
+			}
+		}
+	}
+}
+
+// pushBundle sends an encoding symbol to the kafka partition (i.e., topic).
+func (cb *CurrentBlock) pushBundle(blockHeaderNumber uint64, blockcount int, channelID string, value []byte) {
+	deliveryChan := make(chan kafka.Event, 10000)
+
+	go func() {
+		select {
+		case deliveryReport := <-deliveryChan:
+			m := deliveryReport.(*kafka.Message)
+
+			if m.TopicPartition.Error != nil {
+				fmt.Printf("Delivery failed: %v\n", m.TopicPartition.Error)
+			} else if string(m.Value) == "Over rate limit" {
+				fmt.Println("Over rate limit")
+				time.Sleep(5 * time.Second)
+			} else {
+				fmt.Printf("[%s] => Delivered message to topic [%d] at offset %v with key '%s'", *m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset, m.Key)
+			}
+		}
+	}()
+
+	// Push message to Kafka with key by specifying topic
+	err := kafkaProducer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &channelID, Partition: kafka.PartitionAny},
+		Value:          value,
+	}, deliveryChan) // cb.produceChan is for checking acks
+	if err != nil {
+		fmt.Printf("Failed to produce message: %s\n", err)
+		return
+	}
+}
+
+// ackListener waits for ack message from real-time processor that indicates the processor
+// successfully decoded the block data.
+// When a producer pulls OK sign, it immediately stop to push encoded symbols into Kafka.
+func (cb *CurrentBlock) ackListener() {
+	fmt.Println("Now listening to Kafka ACK ...")
+
+	brokers := []string{kafkabroker1, kafkabroker2, kafkabroker3}
+
+	ackConsumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": brokers,
+		"group.id":          "ackGroup",
+		"auto.offset.reset": "earliest",
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	ackConsumer.SubscribeTopics([]string{"ack-topic"}, nil)
+	defer ackConsumer.Close()
+
+	for {
+		msg, err := ackConsumer.ReadMessage(-1)
+		if err == nil {
+			recvAck := structures.ACK{}
+			json.Unmarshal(msg.Value, &recvAck)
+
+			if reflect.DeepEqual(recvAck.Id, cb.Id) {
+				cb.setAckChannel(true)
+				fmt.Println("Received msg:", string(recvAck.AckMessage), "for ID", cb.Id)
+			} else {
+				fmt.Println("ID does not match, Received ID:", recvAck.Id, "Current ID:", cb.Id)
+			}
+		}
+	}
 }
 
 // allValidated returns error if some of the validation flags have not been set
