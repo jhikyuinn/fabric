@@ -8,12 +8,20 @@ package gossip
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	config "github.com/hyperledger/fabric/weaveutils/config"
+	contribution "github.com/hyperledger/fabric/weaveutils/contribution"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 
 	"github.com/golang/protobuf/proto"
 	pg "github.com/hyperledger/fabric-protos-go/gossip"
@@ -140,6 +148,10 @@ func New(conf *Config, s *grpc.Server, sa api.SecurityAdvisor,
 	g.certPuller = g.createCertStorePuller()
 	g.certStore = newCertStore(g.certPuller, g.idMapper, selfIdentity, mcs)
 
+	if strings.Contains(self.Endpoint, "peer0.org1.example.com") {
+		go g.pushMembership()
+	}
+
 	if g.conf.ExternalEndpoint == "" {
 		g.logger.Warning("External endpoint is empty, peer will not be accessible outside of its organization")
 	}
@@ -150,6 +162,63 @@ func New(conf *Config, s *grpc.Server, sa api.SecurityAdvisor,
 	go g.connect2BootstrapPeers()
 
 	return g
+}
+
+// pushMembership sends hearbeat message(e.g. fabric channel ID and the number of connected peers)
+// to the Kafka every 5 seconds,which allows to monitor the status of peers.
+func (g *Node) pushMembership() {
+	var channelID string
+	channelID = ""
+
+	// LOGIC: pushing the number of members to kafka topic
+	for {
+		if len(g.chanState.channels) == 0 {
+			continue
+		} else {
+			if channelID == "" {
+				for id := range g.chanState.channels {
+					channelID = id
+				}
+
+				brokers := []string{os.Getenv("KAFKA_BROKER1"), os.Getenv("KAFKA_BROKER2"), os.Getenv("KAFKA_BROKER3")}
+				consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+					"bootstrap.servers": brokers,
+					"group.id":          "channelGroup",
+					"auto.offset.reset": "earliest",
+				})
+				if err != nil {
+					panic(err)
+				}
+
+				consumer.SubscribeTopics([]string{channelID}, nil)
+				consumer.Close()
+			}
+		}
+
+		topic := "contribution-topic"
+
+		producer := config.Kafka()
+
+		deliveryChan := make(chan kafka.Event)
+
+		data := contribution.FabricChannel{
+			Type:      2,
+			ChannelId: channelID,
+			Members:   len(g.disc.GetMembership()) + 1, // mempool + leader peer self
+		}
+
+		value, _ := json.Marshal(data)
+
+		err := producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Value:          value,
+		}, deliveryChan)
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func (g *Node) newStateInfoMsgStore() msgstore.MessageStore {
